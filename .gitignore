@@ -1,0 +1,12 @@
+# 本地实测用的临时 PostgreSQL 二进制/数据，不属于交付物
+/.local-pg/
+/pgdata-local/
+/pgdata2/
+/pgdata3/
+/pgdata4/
+/pgdata5/
+/pg-local/
+*.pyc
+__pycache__/
+.pytest_cache/
+/tmp/

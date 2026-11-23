@@ -1,0 +1,10 @@
+2026-11-23 03:15:49.287 UTC [1400] LOG:  starting PostgreSQL 15.18 (Debian 15.18-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+2026-11-23 03:15:49.287 UTC [1400] LOG:  listening on IPv4 address "127.0.0.1", port 55453
+2026-11-23 03:15:49.290 UTC [1400] LOG:  listening on Unix socket "/workspace/pgdata4/sock/.s.PGSQL.55453"
+2026-11-23 03:15:49.298 UTC [1403] LOG:  database system was interrupted; last known up at 2026-11-23 03:13:29 UTC
+2026-11-23 03:15:50.040 UTC [1403] LOG:  entering standby mode
+2026-11-23 03:15:50.040 UTC [1403] FATAL:  invalid data in file "backup_label"
+2026-11-23 03:15:50.044 UTC [1400] LOG:  startup process (PID 1403) exited with exit code 1
+2026-11-23 03:15:50.044 UTC [1400] LOG:  terminating any other active server processes
+2026-11-23 03:15:55.049 UTC [1400] LOG:  issuing SIGKILL to recalcitrant children
+2026-11-23 03:16:52.127 UTC [1411] FATAL:  the database system is in recovery mode

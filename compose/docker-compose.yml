@@ -1,0 +1,85 @@
+# PostgreSQL 主备单向切换演示平台
+# 启动：docker compose up -d --build
+services:
+  primary:
+    image: postgres:15-bookworm
+    container_name: demo-primary
+    environment:
+      POSTGRES_USER: ${PG_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:-postgres-pass}
+      POSTGRES_DB: ${PG_APP_DB:-appdb}
+      # 下列变量只被 /docker-entrypoint-initdb.d 里的初始化脚本读取
+      PG_APP_USER: ${PG_APP_USER:-app}
+      PG_APP_PASSWORD: ${PG_APP_PASSWORD:-apppass}
+      PG_REPL_USER: ${PG_REPL_USER:-repl}
+      PG_REPL_PASSWORD: ${PG_REPL_PASSWORD:-replpass}
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_ADMIN_USER:-postgres} -d ${PG_APP_DB:-appdb}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      - demo-net
+
+  standby:
+    image: postgres:15-bookworm
+    container_name: demo-standby
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: primary
+      PG_REPL_USER: ${PG_REPL_USER:-repl}
+      PG_REPL_PASSWORD: ${PG_REPL_PASSWORD:-replpass}
+      PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
+      PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD:-postgres-pass}
+      PG_APP_DB: ${PG_APP_DB:-appdb}
+    volumes:
+      - standby-data:/var/lib/postgresql/data
+      - ./postgres/standby/entrypoint.sh:/usr/local/bin/standby-entrypoint.sh:ro
+    entrypoint: ["/usr/local/bin/standby-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_ADMIN_USER:-postgres} -d ${PG_APP_DB:-appdb}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      - demo-net
+
+  web:
+    build: ./web
+    container_name: demo-web
+    depends_on:
+      primary:
+        condition: service_healthy
+      standby:
+        condition: service_healthy
+    environment:
+      PG_A_HOST: primary
+      PG_B_HOST: standby
+      PG_APP_USER: ${PG_APP_USER:-app}
+      PG_APP_PASSWORD: ${PG_APP_PASSWORD:-apppass}
+      PG_APP_DB: ${PG_APP_DB:-appdb}
+      PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
+      PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD:-postgres-pass}
+      STATE_FILE: /data/state/switch.json
+      SWITCH_TIMEOUT: ${SWITCH_TIMEOUT:-20}
+      POLL_INTERVAL: ${POLL_INTERVAL:-1}
+      PROMOTE_WAIT_SECONDS: ${PROMOTE_WAIT_SECONDS:-30}
+    volumes:
+      - web-state:/data/state
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    networks:
+      - demo-net
+
+volumes:
+  primary-data:
+  standby-data:
+  web-state:
+
+networks:
+  demo-net:

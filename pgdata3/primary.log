@@ -1,0 +1,6 @@
+2026-11-23 03:01:19.445 UTC [1137] LOG:  starting PostgreSQL 15.18 (Debian 15.18-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+2026-11-23 03:01:19.445 UTC [1137] LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+2026-11-23 03:01:19.445 UTC [1137] HINT:  Is another postmaster already running on port 55442? If not, wait a few seconds and retry.
+2026-11-23 03:01:19.445 UTC [1137] WARNING:  could not create listen socket for "127.0.0.1"
+2026-11-23 03:01:19.445 UTC [1137] FATAL:  could not create any TCP/IP sockets
+2026-11-23 03:01:19.447 UTC [1137] LOG:  database system is shut down
