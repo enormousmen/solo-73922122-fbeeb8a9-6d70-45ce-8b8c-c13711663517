@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PostgreSQL 主备单向切换演示</title>
+<title>PostgreSQL 主备单向切换与检修单 WAL 落盘核验演示</title>
 <style>
   :root { --ok:#1a7f37; --warn:#b26a00; --err:#c0392b; --line:#d0d7de; --bg:#f6f8fa; }
   * { box-sizing: border-box; }
@@ -38,12 +38,15 @@
   code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
   .hist-result-SUCCESS { color:var(--ok); font-weight:600; }
   .hist-result-TIMEOUT,.hist-result-FAILED { color:var(--err); font-weight:600; }
+  .v-CONFIRMED { background:#dafbe1; color:var(--ok); }
+  .v-BEHIND { background:#fff8c5; color:var(--warn); }
+  .v-UNREACHABLE,.v-PROMOTED,.v-TICKET_NOT_FOUND { background:#ffebe9; color:var(--err); }
 </style>
 </head>
 <body>
 <header>
-  <h1>PostgreSQL 流复制 · 主备单向切换演示</h1>
-  <p>切换受理后新写入返回 503 稍后重试；备库回放完旧主已提交事务后才提升；回放超时自动回滚恢复旧主写入。</p>
+  <h1>PostgreSQL 流复制 · 主备切换与检修单 WAL 落盘核验</h1>
+  <p>检修记录在主库 A 提交后返回核验单号，单号绑定覆盖本次提交的 WAL 位置；凭单号核验备库 B 是否已落盘，回放暂停或断流不影响已落盘的确认。</p>
 </header>
 <main>
   <section class="card">
@@ -75,6 +78,28 @@
       <div id="records"></div>
     </section>
   </div>
+
+  <section class="card">
+    <h2>检修记录录入与 WAL 落盘核验（A 主库录入，B 备库核验）</h2>
+    <div class="grid2">
+      <div>
+        <form id="maint-form">
+          <input type="text" id="maint-content" placeholder="输入检修内容，如 1号机组例行检修" required>
+          <button class="primary" type="submit">在 A 录入</button>
+        </form>
+        <p class="muted">提交成功即返回核验单号；B 断流时 A 仍可正常录入。绑定的 WAL 位置覆盖本次提交，之后不可改变。</p>
+        <div id="maint-result"></div>
+      </div>
+      <div>
+        <form id="verify-form">
+          <input type="text" id="verify-ticket" placeholder="输入核验单号，如 MH20261123000001" required>
+          <button type="submit">凭单号核验 B 落盘</button>
+        </form>
+        <p class="muted">只要 B 仍是备库且该位置已落盘即确认；回放暂停、断流也确认。进度不足 / B 不可达 / B 已提升分别说明原因。</p>
+        <div id="verify-result"></div>
+      </div>
+    </div>
+  </section>
 
   <section class="card">
     <h2>单向切换 / 回放控制</h2>
@@ -197,6 +222,52 @@ $("replay-form").addEventListener("submit", async (ev) => {
     showMsg(`节点 ${r.node} 回放已${r.replay_paused?"暂停（切换将在超时后回滚）":"恢复，重新发起切换即可成功"}`, r.replay_paused?"warn":"ok");
   } catch (e) { showMsg("回放控制失败：" + e.message, "err"); }
   refresh();
+});
+
+$("maint-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await api("/api/maintenance", {method:"POST", body:JSON.stringify({content:$("maint-content").value})});
+    $("maint-result").innerHTML =
+      `<table><tbody>
+        <tr><th>核验单号</th><td><b>${esc(r.ticket_no)}</b></td></tr>
+        <tr><th>绑定 WAL 位置</th><td><code>${esc(r.wal_lsn)}</code>（段文件 <code>${esc(r.wal_segment)}</code>）</td></tr>
+        <tr><th>录入节点</th><td>${esc(r.node)} · ${esc(r.written_by)}</td></tr>
+        <tr><th>提交时间</th><td>${esc(r.created_at)}</td></tr>
+       </tbody></table><p class="muted">${esc(r.message)}</p>`;
+    $("verify-ticket").value = r.ticket_no;
+    $("maint-content").value = "";
+  } catch (e) {
+    $("maint-result").innerHTML = `<p class="hist-result-TIMEOUT">录入失败：${esc(e.message)}</p>`;
+  }
+});
+
+$("verify-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const ticket = $("verify-ticket").value.trim();
+  try {
+    const r = await api("/api/maintenance/verify", {method:"POST", body:JSON.stringify({ticket_no:ticket})});
+    const t = r.ticket || {};
+    $("verify-result").innerHTML =
+      `<p><span class="badge v-${esc(r.status)}">${esc(r.status)}</span>
+       ${r.confirmed ? "✅ 已确认" : "⚠️ 暂不能确认"}</p>
+       <table><tbody>
+        <tr><th>核验单号</th><td>${esc(r.ticket_no)}</td></tr>
+        <tr><th>绑定 WAL 位置</th><td><code>${esc(r.bound_lsn ?? "-")}</code></td></tr>
+        <tr><th>B 已落盘位置</th><td><code>${esc(r.standby_receive_lsn ?? "-")}</code>
+          <span class="muted">（pg_last_wal_receive_lsn，已 fsync）</span></td></tr>
+        <tr><th>B 回放位置</th><td><code>${esc(r.standby_replay_lsn ?? "-")}</code></td></tr>
+        <tr><th>B 回放暂停</th><td>${r.replay_paused===null?"-":(r.replay_paused?"是":"否")}
+          ｜ WAL 接收连接 ${r.streaming===null?"-":(r.streaming?"连接中":"断流")}</td></tr>
+        <tr><th>检修内容</th><td>${esc(t.content ?? "-")}（${esc(t.created_at ?? "")}）</td></tr>
+       </tbody></table><p class="muted">${esc(r.message)}</p>`;
+  } catch (e) {
+    const d = e.data && e.data.detail;
+    const msg = d && typeof d === "object" ? d.message : e.message;
+    const code = d && typeof d === "object" ? d.error : "ERROR";
+    $("verify-result").innerHTML =
+      `<p><span class="badge v-${esc(code)}">${esc(code)}</span></p><p class="hist-result-TIMEOUT">${esc(msg)}</p>`;
+  }
 });
 
 refresh();

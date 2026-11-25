@@ -6,6 +6,8 @@
 /pgdata4/
 /pgdata5/
 /pg-local/
+/pg-e2e/
+/.venv/
 *.pyc
 __pycache__/
 .pytest_cache/

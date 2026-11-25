@@ -41,7 +41,21 @@ CREATE TABLE IF NOT EXISTS demo_records (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 GRANT SELECT, INSERT ON demo_records TO ${PG_APP_USER};
-GRANT USAGE, ALL ON SEQUENCE demo_records_id_seq TO ${PG_APP_USER};
+GRANT ALL PRIVILEGES ON SEQUENCE demo_records_id_seq TO ${PG_APP_USER};
+
+-- 检修记录核验单：单号主键，wal_lsn 为提交后锁定、覆盖本次提交的 WAL 位置。
+-- 该表只 INSERT 不 UPDATE/DELETE，绑定关系随流复制物理复制到备库。
+CREATE SEQUENCE IF NOT EXISTS maintenance_ticket_seq;
+CREATE TABLE IF NOT EXISTS maintenance_records (
+    ticket_no   TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    wal_lsn     PG_LSN NOT NULL,
+    wal_segment TEXT NOT NULL,
+    written_by  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+GRANT SELECT, INSERT, UPDATE ON maintenance_records TO ${PG_APP_USER};
+GRANT ALL PRIVILEGES ON SEQUENCE maintenance_ticket_seq TO ${PG_APP_USER};
 SQL
 
-echo "init: roles and demo_records table created"
+echo "init: roles, demo_records and maintenance_records tables created"

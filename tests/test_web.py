@@ -93,6 +93,52 @@ class WebFakeAdapter:
     def ensure_schema(self) -> None:
         return None
 
+    # --- 检修核验单的内存假实现 --- #
+    def __init_ticket_state(self) -> None:
+        if not hasattr(self, "tickets"):
+            self.tickets = {}
+            self.ticket_seq = 0
+            self.b_unreachable = False
+            self.b_promoted = False
+
+    def create_maintenance_ticket(self, node: str, content: str) -> dict:
+        self.__init_ticket_state()
+        self.ticket_seq += 1
+        ticket_no = f"MH20261123{self.ticket_seq:06d}"
+        bound = self.lsn[node]
+        ticket = {
+            "ticket_no": ticket_no,
+            "content": content,
+            "wal_lsn": bound,
+            "wal_segment": "000000010000000000000000",
+            "written_by": f"node-{node}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "node": node,
+        }
+        self.tickets[ticket_no] = ticket
+        # 模拟真实写入：主库 LSN 前进，备库尚未追上
+        high, low = bound.split("/")
+        self.lsn[node] = f"{high}/{int(low, 16) + 0x100:X}"
+        return ticket
+
+    def get_maintenance_ticket(self, node: str, ticket_no: str):
+        self.__init_ticket_state()
+        return self.tickets.get(ticket_no)
+
+    def standby_wal_snapshot(self, node: str):
+        self.__init_ticket_state()
+        if self.b_unreachable:
+            return None
+        if self.b_promoted:
+            return {"in_recovery": False}
+        return {
+            "in_recovery": True,
+            "receive_lsn": self.lsn["B"],
+            "replay_lsn": self.replayed["B"],
+            "replay_paused": self.paused,
+            "streaming": not getattr(self, "b_disconnected", False),
+        }
+
     def insert_record(self, node: str, content: str) -> dict:
         row = {
             "id": self._next_id, "content": content,
@@ -257,6 +303,113 @@ class WebApiTest(unittest.TestCase):
         roles = {n["name"]: n["role"] for n in r.json()["nodes"]}
         self.assertEqual(roles, {"A": "primary", "B": "standby"})
         self.assertEqual(r.json()["cluster"]["phase"], PHASE_NORMAL)
+
+    # ---------------- 检修核验单 ---------------- #
+    def _create_ticket(self, content="机组检修-1"):
+        r = self.client.post("/api/maintenance", json={"content": content})
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def test_ticket_binds_lsn_and_immutable_across_later_writes(self) -> None:
+        first = self._create_ticket("first")
+        bound = first["wal_lsn"]
+        self.assertTrue(first["ticket_no"].startswith("MH"))
+        # 后续录入不改变原单号绑定的 LSN。
+        second = self._create_ticket("second")
+        detail = self.client.get(f"/api/maintenance/{first['ticket_no']}").json()
+        self.assertEqual(detail["wal_lsn"], bound)
+        self.assertNotEqual(second["ticket_no"], first["ticket_no"])
+
+    def test_verify_behind_then_confirmed_after_catch_up(self) -> None:
+        ticket = self._create_ticket()
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "BEHIND")
+
+        self.adapter.catch_up()
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        body = r.json()
+        self.assertEqual(body["status"], "CONFIRMED")
+        self.assertTrue(body["confirmed"])
+        self.assertEqual(body["bound_lsn"], ticket["wal_lsn"])
+
+    def test_verify_confirmed_while_replay_paused(self) -> None:
+        ticket = self._create_ticket()
+        self.adapter.catch_up()
+        self.client.post("/api/replay/pause", json={})
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        body = r.json()
+        self.assertEqual(body["status"], "CONFIRMED")
+        self.assertTrue(body["replay_paused"])
+        self.assertIn("回放已暂停", body["message"])
+
+    def test_verify_confirmed_while_stream_disconnected(self) -> None:
+        ticket = self._create_ticket()
+        self.adapter.catch_up()
+        self.adapter.b_disconnected = True  # 断流：receive LSN 保持不动
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        body = r.json()
+        self.assertEqual(body["status"], "CONFIRMED")
+        self.assertFalse(body["streaming"])
+        self.assertIn("断流", body["message"])
+
+    def test_verify_unreachable(self) -> None:
+        ticket = self._create_ticket()
+        self.adapter.b_unreachable = True
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        self.assertEqual(r.json()["status"], "UNREACHABLE")
+
+    def test_verify_promoted(self) -> None:
+        ticket = self._create_ticket()
+        self.adapter.b_promoted = True
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+        )
+        self.assertEqual(r.json()["status"], "PROMOTED")
+
+    def test_verify_unknown_ticket_returns_404(self) -> None:
+        r = self.client.post(
+            "/api/maintenance/verify", json={"ticket_no": "MH-NOPE"}
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["error"], "TICKET_NOT_FOUND")
+
+    def test_ticket_survives_web_restart(self) -> None:
+        ticket = self._create_ticket("before-restart")
+        # 绑定关系在数据库里；新进程（同一假适配器模拟同一库）仍能凭单号核验。
+        second_app = create_app(
+            Settings(
+                node_a=NodeConfig("A", "ahost", 5432, "u", "p", "db", "admin", "apass"),
+                node_b=NodeConfig("B", "bhost", 5432, "u", "p", "db", "admin", "apass"),
+                state_file=os.path.join(self.tmp.name, "switch2.json"),
+                switch_timeout=5.0, poll_interval=1.0, promote_wait_seconds=5,
+                background_worker=False,
+            ),
+            self.adapter,
+        )
+        with TestClient(second_app) as client2:
+            self.adapter.catch_up()
+            r = client2.post(
+                "/api/maintenance/verify", json={"ticket_no": ticket["ticket_no"]}
+            )
+            self.assertEqual(r.json()["status"], "CONFIRMED")
+            self.assertEqual(r.json()["bound_lsn"], ticket["wal_lsn"])
+
+    def test_maintenance_write_blocked_during_switch(self) -> None:
+        self.client.post("/api/replay/pause", json={})
+        self.client.post("/api/switch", json={})
+        r = self.client.post("/api/maintenance", json={"content": "blocked"})
+        self.assertEqual(r.status_code, 503)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
-# PostgreSQL 主备单向切换演示平台
+# PostgreSQL 主备流复制 + 检修单 WAL 落盘核验演示平台
 # 启动：docker compose up -d --build
+#
+# 两张网络：
+#   demo-net      网页 ↔ A/B 的 SQL 访问（断流演示时保持连通，网页仍可查 B）
+#   repl-net      A ↔ B 的 WAL 流复制（断流演示时断开 B 这张网卡即可）
 services:
   primary:
     image: postgres:15-bookworm
@@ -22,7 +26,11 @@ services:
       timeout: 3s
       retries: 30
     networks:
-      - demo-net
+      demo-net:
+      repl-net:
+        aliases:
+          # 备库的 primary_conninfo 固定用该别名；断开 B 的 repl-net 网卡即断流
+          - primary-repl
 
   standby:
     image: postgres:15-bookworm
@@ -31,7 +39,8 @@ services:
       primary:
         condition: service_healthy
     environment:
-      PRIMARY_HOST: primary
+      # 基础备份与流复制都走复制专用网络上的 primary-repl 主机名
+      PRIMARY_HOST: primary-repl
       PG_REPL_USER: ${PG_REPL_USER:-repl}
       PG_REPL_PASSWORD: ${PG_REPL_PASSWORD:-replpass}
       PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
@@ -48,9 +57,13 @@ services:
       retries: 30
     networks:
       - demo-net
+      - repl-net
 
   web:
-    build: ./web
+    # 上下文取仓库根：Dockerfile 在 compose/web/，应用源码在仓库根的 app/
+    build:
+      context: ..
+      dockerfile: compose/web/Dockerfile
     container_name: demo-web
     depends_on:
       primary:
@@ -58,6 +71,7 @@ services:
       standby:
         condition: service_healthy
     environment:
+      # 网页的 SQL 访问固定走 demo-net 上的主机名 primary/standby
       PG_A_HOST: primary
       PG_B_HOST: standby
       PG_APP_USER: ${PG_APP_USER:-app}
@@ -83,3 +97,4 @@ volumes:
 
 networks:
   demo-net:
+  repl-net:

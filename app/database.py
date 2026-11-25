@@ -24,6 +24,22 @@ CREATE TABLE IF NOT EXISTS demo_records (
 )
 """
 
+# 检修记录核验单：单号主键，wal_lsn 为提交后锁定的绑定 WAL 位置（pg_lsn 可直接比较）。
+# 绑定行只在创建时写一次，之后没有任何 UPDATE/DELETE 路径，保证不可变性。
+CREATE_MAINTENANCE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS maintenance_records (
+    ticket_no   TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    wal_lsn     PG_LSN NOT NULL,
+    wal_segment TEXT NOT NULL,
+    written_by  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+CREATE_MAINTENANCE_SEQ_SQL = (
+    "CREATE SEQUENCE IF NOT EXISTS maintenance_ticket_seq"
+)
+
 
 class PgClusterAdapter:
     """实现 switcher.ClusterAdapter 协议的真实 PostgreSQL 操作集合。"""
@@ -206,10 +222,32 @@ class PgClusterAdapter:
         return status
 
     def ensure_schema(self) -> None:
-        # 建表需要建表权限：由初始化脚本 GRANT 给 app 角色；DDL 经流复制到备库。
+        # DDL 与授权统一走管理员连接：容器内表由初始化脚本以超级用户创建，
+        # 只有属主/超级用户能 GRANT；本地与容器行为因此保持一致。
+        # DDL 经流复制物理复制到备库。
         leader = self.settings.node_a.name  # 仅启动阶段调用，初始主固定为 A
-        with self._connect(leader) as conn, conn.cursor() as cur:
+        app_user = self._nodes[leader].user
+        with self._connect(leader, admin=True) as conn, conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
+            cur.execute(CREATE_MAINTENANCE_SEQ_SQL)
+            cur.execute(CREATE_MAINTENANCE_TABLE_SQL)
+            cur.execute(
+                "GRANT SELECT, INSERT ON demo_records TO " + app_user
+            )
+            cur.execute(
+                "GRANT ALL PRIVILEGES ON SEQUENCE demo_records_id_seq TO " + app_user
+            )
+            # maintenance_records 的 UPDATE 仅用于录入时一次性回写绑定 LSN，
+            # 不存在任何按单号改写既有行的接口路径。
+            cur.execute(
+                "GRANT SELECT, INSERT, UPDATE ON maintenance_records TO " + app_user
+            )
+            # 序列权限没有 USAGE, ALL 的写法：ALL PRIVILEGES 等价
+            # USAGE/SELECT/UPDATE 全授予，nextval() 需要 USAGE。
+            cur.execute(
+                "GRANT ALL PRIVILEGES ON SEQUENCE maintenance_ticket_seq TO "
+                + app_user
+            )
 
     # --- 示例记录读写 -------------------------------------------------- #
     def insert_record(self, node: str, content: str) -> Dict[str, Any]:
@@ -246,3 +284,115 @@ class PgClusterAdapter:
             }
             for r in rows
         ]
+
+    # --- 检修记录核验单 ------------------------------------------------ #
+    def create_maintenance_ticket(self, node: str, content: str) -> Dict[str, Any]:
+        """在主库录入检修记录并返回核验单号与绑定的 WAL 位置。
+
+        分两个事务，严格保证绑定 LSN 覆盖本次提交：
+
+        1. 事务一：插入检修记录（含取号），提交即持久化；
+        2. 事务二：提交后读取 ``pg_current_wal_lsn()``。该函数返回事务日志
+           写入的当前位置，必然不早于事务一提交记录（含 commit WAL 记录）
+           的位置，因此绑定 LSN 一定覆盖本次提交，并一次性回写该行。
+
+        回写只发生在本次录入流程内；没有任何按单号改写或删除既有行的
+        接口，因此后续录入与网页重启都不会改变已返回单号的绑定位置。
+        """
+        with self._connect(node) as conn, conn.cursor() as cur:
+            # 事务一：取号 + 插入 + 提交
+            cur.execute("SELECT nextval('maintenance_ticket_seq')")
+            seq = int(cur.fetchone()[0])
+            ticket_no = "MH" + time.strftime("%Y%m%d") + f"{seq:06d}"
+            cur.execute(
+                "INSERT INTO maintenance_records "
+                "(ticket_no, content, wal_lsn, wal_segment, written_by) "
+                "VALUES (%s, %s, '0/0'::pg_lsn, %s, %s)",
+                (ticket_no, content, "", f"node-{node}"),
+            )
+            conn.commit()
+
+            # 事务二：提交完成后的当前 WAL 位置，回写绑定（本事务自身的提交
+            # 在该位置之后，不影响“绑定位置覆盖检修记录提交”的保证）。
+            cur.execute("SELECT pg_current_wal_lsn()::text")
+            bound_lsn = str(cur.fetchone()[0])
+            # 段文件名直接问数据库，保证时间线/段大小与实例一致。
+            cur.execute("SELECT pg_walfile_name(%s::pg_lsn)", (bound_lsn,))
+            segment = str(cur.fetchone()[0])
+            cur.execute(
+                "UPDATE maintenance_records SET wal_lsn = %s::pg_lsn, "
+                "wal_segment = %s WHERE ticket_no = %s",
+                (bound_lsn, segment, ticket_no),
+            )
+            conn.commit()
+
+            cur.execute(
+                "SELECT ticket_no, content, wal_lsn::text, wal_segment, "
+                "written_by, created_at FROM maintenance_records WHERE ticket_no = %s",
+                (ticket_no,),
+            )
+            row = cur.fetchone()
+        return {
+            "ticket_no": row[0],
+            "content": row[1],
+            "wal_lsn": row[2],
+            "wal_segment": row[3],
+            "written_by": row[4],
+            "created_at": row[5].isoformat(),
+            "node": node,
+        }
+
+    def get_maintenance_ticket(self, node: str, ticket_no: str) -> Optional[Dict[str, Any]]:
+        """从指定节点（主库，绑定关系的权威来源）读取核验单绑定信息。"""
+        with self._connect(node) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticket_no, content, wal_lsn::text, wal_segment, "
+                "written_by, created_at FROM maintenance_records WHERE ticket_no = %s",
+                (ticket_no,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "ticket_no": row[0],
+            "content": row[1],
+            "wal_lsn": row[2],
+            "wal_segment": row[3],
+            "written_by": row[4],
+            "created_at": row[5].isoformat(),
+            "node": node,
+        }
+
+    def standby_wal_snapshot(self, node: str) -> Optional[Dict[str, Any]]:
+        """读取备库 B 的落盘/回放快照；连接失败返回 None（即 B 不可达）。
+
+        核验依据是 ``pg_last_wal_receive_lsn()``：备库通过流复制接收到的
+        WAL 已同步（fsync）到磁盘的最后位置——即使回放暂停或已与主库断流，
+        该位置之前的 WAL 都已落盘，不会回退。
+        """
+        try:
+            with self._connect(node, admin=True) as conn, conn.cursor() as cur:
+                cur.execute("SELECT pg_is_in_recovery()")
+                in_recovery = bool(cur.fetchone()[0])
+                if not in_recovery:
+                    return {"in_recovery": False}
+                cur.execute(
+                    "SELECT pg_last_wal_receive_lsn()::text, "
+                    "pg_last_wal_replay_lsn()::text, "
+                    "pg_is_wal_replay_paused(), "
+                    # 断流后 walreceiver 进程仍在重试，视图行还在，
+                    # 只有 status='streaming' 才表示复制连接真正连通。
+                    "COALESCE((SELECT status = 'streaming' "
+                    "          FROM pg_stat_wal_receiver), false)"
+                )
+                receive_lsn, replay_lsn, paused, receiver_up = cur.fetchone()
+                return {
+                    "in_recovery": True,
+                    "receive_lsn": str(receive_lsn) if receive_lsn is not None else None,
+                    "replay_lsn": str(replay_lsn) if replay_lsn is not None else None,
+                    "replay_paused": bool(paused),
+                    "streaming": bool(receiver_up),
+                }
+        except Exception as exc:  # 连接拒绝/超时/主机不可达均归为不可达
+            logger.warning("读取备库 %s 快照失败，视为不可达：%r", node, exc)
+            return None

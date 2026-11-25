@@ -1,0 +1,12 @@
+# Docker 构建上下文（仓库根）忽略项：本地数据/二进制/缓存，不进入镜像
+.git/
+.gitignore
+.local-pg/
+pgdata*/
+pg-local/
+pg-e2e/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tmp/
